@@ -1,8 +1,6 @@
 # Environment & Sensitive Keys
 .env
 
-# Submission Notes (kept locally, not pushed to GitHub)
-
 
 # Python
 __pycache__/
