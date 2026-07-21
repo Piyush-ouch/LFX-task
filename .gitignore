@@ -1,0 +1,20 @@
+# Environment & Sensitive Keys
+.env
+*.env
+
+# Submission Notes (Not to be pushed)
+SUBMISSION.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.env/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp

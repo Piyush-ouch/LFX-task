@@ -1,0 +1,13 @@
+parameters:
+  - name: cache_capacity
+    description: The capacity of a cache in the system.
+    type: integer
+    constraints: Implementation-specific.
+  - name: cache_organization
+    description: The organization of a cache in the system.
+    type: string
+    constraints: Implementation-specific.
+  - name: cache_block_size
+    description: The size of a cache block.
+    type: integer
+    constraints: Implementation-specific. Must represent a contiguous, naturally aligned power-of-two (NAPOT) range of memory locations. In the initial set of CMO extensions, the size of a cache block shall be uniform throughout the system.
