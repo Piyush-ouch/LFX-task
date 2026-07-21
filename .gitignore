@@ -2,7 +2,7 @@
 .env
 
 # Submission Notes (kept locally, not pushed to GitHub)
-SUBMISSION.md
+
 
 # Python
 __pycache__/
