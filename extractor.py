@@ -1,193 +1,247 @@
 """
-AI-assisted RISC-V Architectural Parameter Extractor
+AI-Assisted RISC-V Architectural Parameter Extractor
 
-Reads a specification snippet from input.txt,
-sends it to an LLM, and saves the extracted parameters as YAML.
+Reads RISC-V specification snippets from input.txt, sends them to an LLM
+with a carefully engineered system prompt, validates the response, and
+saves extracted parameters as structured YAML.
+
+Supports Google Gemini (free tier) and OpenAI as LLM backends.
 """
 
+import logging
 import os
 import sys
+
 import yaml
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Load environment variables from .env if present
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 load_dotenv()
 
-SYSTEM_PROMPT = """
-You are an expert RISC-V ISA analyst.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
-Your task is to extract architectural parameters from the provided RISC-V specification.
+# ---------------------------------------------------------------------------
+# System Prompt  (v3 — production)
+#
+# Evolution notes
+#   v1  prompts/v1_naive.txt      — "Extract parameters …" → hallucinated CSR constants
+#   v2  prompts/v2_keyword.txt    — added trigger-word list → inconsistent type field
+#   v3  (below)                   — 1-shot example + negative rules + source tracing
+# ---------------------------------------------------------------------------
 
-A parameter should be extracted when it represents:
+SYSTEM_PROMPT = """\
+You are an expert RISC-V ISA specification analyst.
 
-- implementation-defined behavior
-- implementation-specific behavior
-- optional features
-- configurable architectural properties
-- privilege-dependent architectural fields
-- execution environment dependent properties
+TASK
+----
+Extract **only** configurable architectural parameters from the provided
+RISC-V specification text.
 
-Do NOT invent parameters.
+WHAT COUNTS AS A PARAMETER
+---------------------------
+A parameter must be explicitly described in the text using language such as:
+  • "implementation-defined" or "implementation-specific"
+  • "optional" / "optionally"
+  • "may" / "might" / "should"
+  • "execution environment provides … a means to discover"
 
-Every extracted parameter must appear explicitly in the specification.
+WHAT IS **NOT** A PARAMETER
+-----------------------------
+Do NOT extract:
+  • Fixed architectural constants (e.g. "12-bit encoding space")
+  • Mandatory ISA encoding rules (e.g. CSR address bit allocations)
+  • Static bit-field definitions that are identical across all implementations
 
-Return ONLY valid YAML.
+RULES
+-----
+1. Every parameter you output MUST appear explicitly in the input text.
+2. Do NOT invent, infer, or hallucinate parameters.
+3. The `type` field must be one of: implementation-specific, implementation-defined, optional, or execution-environment-defined.
+4. The `constraints` field must be a YAML list of individual constraint strings.
+5. Include a `source` field with the specification section reference.
 
-Schema:
+OUTPUT FORMAT
+-------------
+Return ONLY valid YAML matching the schema below.  No markdown fences, no
+commentary, no extra text.
 
 parameters:
-  - name:
-    description:
-    type:
+  - name: <snake_case name>
+    description: <one-line description>
+    type: <implementation-specific | implementation-defined | optional | execution-environment-defined>
     constraints:
+      - <constraint 1>
+      - <constraint 2>
+    source: <spec section reference, e.g. "Privileged Spec 19.3.1">
+
+EXAMPLE
+-------
+Given input containing "The reset vector address is implementation-defined
+and must be aligned to a 4-byte boundary (Privileged Spec 3.4)", you would
+output:
+
+parameters:
+  - name: reset_vector_address
+    description: Address of the first instruction fetched after reset.
+    type: implementation-defined
+    constraints:
+      - Must be aligned to a 4-byte boundary
+    source: "Privileged Spec 3.4"
 """
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-def clean_yaml_output(raw_content: str) -> str:
-    """Strips Markdown backtick fences if present in LLM output."""
-    content = raw_content.strip()
-    if content.startswith("```"):
-        lines = content.splitlines()
-        # Remove opening ```yaml or ``` line
+def strip_markdown_fences(text: str) -> str:
+    """Remove ```yaml … ``` wrappers that some LLMs add despite instructions."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
         if lines[0].startswith("```"):
             lines = lines[1:]
-        # Remove closing ``` line if present
-        if lines and lines[-1].startswith("```"):
+        if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
-        content = "\n".join(lines).strip()
-    return content
+        text = "\n".join(lines).strip()
+    return text
 
 
-def main():
-    input_file = "input.txt"
-    output_file = "output.yaml"
+def validate_yaml(content: str) -> dict:
+    """Parse YAML string and validate it has the expected schema structure."""
+    data = yaml.safe_load(content)
 
-    # Check for --mock flag for offline evaluation/testing
-    is_mock = "--mock" in sys.argv or os.getenv("MOCK_MODE", "").lower() == "true"
+    if not isinstance(data, dict) or "parameters" not in data:
+        raise ValueError("YAML root must contain a 'parameters' key")
 
-    if is_mock:
-        print("[MOCK MODE] Running offline parameter extraction demonstration...")
-        if not os.path.exists(input_file):
-            print(f"Error: '{input_file}' not found.")
-            sys.exit(1)
+    params = data["parameters"]
+    if not isinstance(params, list):
+        raise ValueError("'parameters' must be a list")
 
-        print(f"Reading specification from {input_file}...")
-        mock_output = """parameters:
-  - name: cache_capacity
-    description: Total capacity of the cache.
-    type: implementation-specific
-    constraints:
-      - Determined by the hardware implementation
-      - Discoverable through the execution environment
+    required_fields = {"name", "description", "type", "constraints"}
+    valid_types = {
+        "implementation-specific",
+        "implementation-defined",
+        "optional",
+        "execution-environment-defined",
+    }
 
-  - name: cache_organization
-    description: Structural organization of the cache.
-    type: implementation-specific
-    constraints:
-      - Determined by the hardware implementation
-      - Discoverable through the execution environment
+    for i, param in enumerate(params):
+        missing = required_fields - set(param.keys())
+        if missing:
+            log.warning("Parameter %d missing fields: %s", i, missing)
 
-  - name: cache_block_size
-    description: Size of an individual cache block.
-    type: implementation-specific
-    constraints:
-      - Uniform throughout the system in the initial set of CMO extensions
-      - Represents a contiguous, naturally aligned power-of-two (NAPOT) memory range
-      - Discoverable through the execution environment"""
+        ptype = param.get("type", "")
+        if ptype not in valid_types:
+            log.warning(
+                "Parameter '%s' has non-standard type '%s' (expected one of %s)",
+                param.get("name", f"#{i}"),
+                ptype,
+                valid_types,
+            )
 
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(mock_output)
+    return data
 
-        print("Extraction completed successfully (Mock Mode).")
-        print(f"Extracted parameters written to {output_file}:\n")
-        print(mock_output)
-        return
 
+def build_client():
+    """
+    Detect API keys and return (client, model_name, provider_label).
+    Priority: GEMINI_API_KEY > OPENAI_API_KEY.
+    """
     gemini_key = os.getenv("GEMINI_API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
 
     if gemini_key:
-        api_key = gemini_key
-        base_url = os.getenv("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
-        model_name = os.getenv("OPENAI_MODEL", "gemini-3.5-flash")
-        provider_info = f"Google Gemini API (Model: {model_name})"
-        client = OpenAI(api_key=api_key, base_url=base_url)
-    elif openai_key:
-        api_key = openai_key
+        base_url = os.getenv(
+            "OPENAI_BASE_URL",
+            "https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
+        model = os.getenv("OPENAI_MODEL", "gemini-2.0-flash-lite")
+        client = OpenAI(api_key=gemini_key, base_url=base_url)
+        return client, model, f"Google Gemini ({model})"
+
+    if openai_key:
         base_url = os.getenv("OPENAI_BASE_URL")
-        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        provider_info = f"OpenAI API (Model: {model_name})"
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        kwargs = {"api_key": openai_key}
         if base_url:
-            client = OpenAI(api_key=api_key, base_url=base_url)
-        else:
-            client = OpenAI(api_key=api_key)
-    else:
-        print("Error: No API key found (neither GEMINI_API_KEY nor OPENAI_API_KEY is set).")
-        print("Please set your API key in a .env file:")
-        print("  - For Google Gemini (Free Tier): GEMINI_API_KEY=your_gemini_key")
-        print("  - For OpenAI:                    OPENAI_API_KEY=your_openai_key")
-        print("\nTip: Run 'python extractor.py --mock' for offline demonstration mode.")
+            kwargs["base_url"] = base_url
+        client = OpenAI(**kwargs)
+        return client, model, f"OpenAI ({model})"
+
+    return None, None, None
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    input_file = os.getenv("INPUT_FILE", "input.txt")
+    output_file = os.getenv("OUTPUT_FILE", "output.yaml")
+
+    # --- Build LLM client ---------------------------------------------------
+    client, model_name, provider = build_client()
+    if client is None:
+        log.error(
+            "No API key found. Set GEMINI_API_KEY or OPENAI_API_KEY in .env"
+        )
+        log.info("Tip: Run 'python extractor.py --mock' for offline demo.")
         sys.exit(1)
 
+    # --- Read specification --------------------------------------------------
     if not os.path.exists(input_file):
-        print(f"Error: '{input_file}' not found.")
+        log.error("Input file '%s' not found.", input_file)
         sys.exit(1)
 
-    print(f"Reading specification from {input_file}...")
-    with open(input_file, "r", encoding="utf-8") as f:
-        specification = f.read()
+    with open(input_file, "r", encoding="utf-8") as fh:
+        specification = fh.read()
+    log.info("Read %d chars from %s", len(specification), input_file)
 
-    print(f"Sending request to {provider_info}...")
+    # --- Call LLM ------------------------------------------------------------
+    log.info("Sending request to %s …", provider)
     try:
         response = client.chat.completions.create(
             model=model_name,
             temperature=0,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": specification},
+                {"role": "user",   "content": specification},
             ],
         )
-
-        raw_output = response.choices[0].message.content
-        yaml_output = clean_yaml_output(raw_output)
-
-        # Validate that output is valid YAML
-        try:
-            parsed_data = yaml.safe_load(yaml_output)
-            if not isinstance(parsed_data, dict) or "parameters" not in parsed_data:
-                print("Warning: Generated output did not contain the expected 'parameters' root key.")
-        except yaml.YAMLError as ye:
-            print(f"Warning: Output generated by LLM was not valid YAML: {ye}")
-
-        # Save extracted parameters to output.yaml
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(yaml_output)
-
-        print("Extraction completed successfully.")
-        print(f"Extracted parameters written to {output_file}:\n")
-        print(yaml_output)
-
-    except Exception as e:
-        err_msg = str(e)
-        print(f"An error occurred during API execution: {err_msg}")
-        if "insufficient_quota" in err_msg or "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-            print("\n[API Quota / Rate Limit Exceeded Error]")
-            if gemini_key:
-                print("Your Google Gemini API Key encountered a rate limit / quota restriction.")
-                print("Solutions:")
-                print("  1. Verify your Gemini API key project limits at https://aistudio.google.com/ app settings.")
-                print("  2. You can set OPENAI_MODEL=gemini-2.0-flash-lite in your .env file.")
-                print("  3. Or test offline demonstration mode using: python extractor.py --mock")
-            else:
-                print("Your OpenAI account currently has $0 available credit balance.")
-                print("Creating a new API key on an account with $0 balance will still return HTTP 429.")
-                print("Solutions:")
-                print("  1. Add prepaid billing credits ($5) at https://platform.openai.com/settings/organization/billing")
-                print("  2. Or test in offline demonstration mode using: python extractor.py --mock")
+    except Exception as exc:
+        log.error("API call failed: %s", exc)
+        if "429" in str(exc) or "quota" in str(exc).lower():
+            log.info("This is a rate-limit / quota error.")
+            log.info("  → Add billing credits, or try a different model.")
         sys.exit(1)
+
+    raw = response.choices[0].message.content
+    cleaned = strip_markdown_fences(raw)
+
+    # --- Validate & save ----------------------------------------------------
+    try:
+        data = validate_yaml(cleaned)
+    except Exception as exc:
+        log.warning("Validation issue: %s — saving raw output anyway.", exc)
+        data = None
+
+    with open(output_file, "w", encoding="utf-8") as fh:
+        fh.write(cleaned + "\n")
+
+    n_params = len(data["parameters"]) if data else "?"
+    log.info("Extracted %s parameters → %s", n_params, output_file)
+    print()
+    print(cleaned)
 
 
 if __name__ == "__main__":
     main()
-

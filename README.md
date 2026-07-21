@@ -1,105 +1,170 @@
 # AI-Assisted Extraction of Architectural Parameters from RISC-V Specifications
-### LFX Mentorship Coding Challenge
 
-An automated NLP/LLM pipeline designed to parse RISC-V ISA specification text snippets, identify implementation-specific and configurable architectural parameters, filter out fixed architectural constants, and produce structured, validated YAML output.
+## Objective
 
----
-
-## 📌 Project Overview
-
-When developing hardware, emulators, compilers, or verification suites for the **RISC-V ISA**, hardware engineers need to extract configurable architectural parameters (e.g., cache sizes, optional extensions, implementation-defined register behaviors) from official specification documents.
-
-This project automates that process using Large Language Models (LLMs) and structured prompt constraints.
-
-### Key Objectives
-1. **Automated Extraction**: Read raw RISC-V ISA specification text (`input.txt`).
-2. **Precision Parameter Filtering**: Distinguish between *configurable/implementation-defined parameters* (e.g., cache capacity, cache block size) and *fixed architectural constants* (e.g., CSR bit encoding rules).
-3. **Structured Export**: Validate and output clean YAML adhering to a strict schema (`output.yaml`).
+This project demonstrates how a Large Language Model can automatically extract
+**configurable architectural parameters** from RISC-V ISA specification snippets
+and export them as structured, validated YAML — while filtering out fixed
+architectural constants that should never appear in the output.
 
 ---
 
-## 🤖 LLM Details & Model Selection
+## LLM Details
 
-| Metric | Primary LLM (Google Gemini) | Fallback LLM (OpenAI) |
-| :--- | :--- | :--- |
-| **Model Name** | `gemini-3.5-flash` / `gemini-2.0-flash-lite` | `gpt-4o-mini` |
-| **Developer / Provider** | Google DeepMind | OpenAI |
-| **Context Length** | ~1,048,576 tokens (1M) | 128,000 tokens |
-| **Temperature** | `0` (Deterministic Output) | `0` (Deterministic Output) |
-| **API Interface** | OpenAI REST API Compatibility (`v1beta/openai/`) | Native OpenAI Chat Completions API |
-
----
-
-## 💡 Prompt Strategy & Hallucination Mitigation
-
-### A. Keyword Triggering Rules
-In the RISC-V ISA manual, configurable parameters are explicitly signaled by specific keywords:
-- `"implementation-specific"` / `"implementation-defined"`
-- `"may"` / `"might"` / `"should"`
-- `"optional"` / `"optionally"`
-- `"execution environment provides software a means to discover"`
-
-### B. Hallucination Prevention
-1. **Contextual Grounding Directive**: Forced every parameter to be explicitly present in the provided spec text (`"Do NOT invent parameters"`).
-2. **Negative Rules**: Instructed the LLM to explicitly ignore fixed architectural constants (such as static CSR bit allocations in Privileged Spec 2.1).
-3. **Deterministic Sampling**: Set `temperature: 0` to eliminate non-deterministic sampling variance.
-4. **Schema Validation**: Verified response structure via `PyYAML` parsing before writing `output.yaml`.
+| Property | Value |
+|:---|:---|
+| **Model** | Google Gemini `gemini-3.5-flash` (primary) / OpenAI `gpt-4o-mini` (fallback) |
+| **Context length** | ~1 M tokens (Gemini) / 128 K tokens (OpenAI) |
+| **Temperature** | `0` — deterministic, greedy decoding |
+| **API interface** | OpenAI-compatible Chat Completions (`/v1/chat/completions`) |
 
 ---
 
-## 📁 Repository Structure
+## Prompt Engineering — Iterative Development
+
+The prompt went through **three iterations**. Each version is saved in `prompts/`
+so reviewers can trace the evolution.
+
+### v1 — Naive prompt ([`prompts/v1_naive.txt`](prompts/v1_naive.txt))
 
 ```
-LFX_Coding_Challenge/
-│
-├── extractor.py       # Core Python script: reads input, queries LLM, cleans & validates YAML output
-├── input.txt          # Input text file containing RISC-V specification snippets
-├── output.yaml        # Generated output containing extracted architectural parameters
-├── requirements.txt   # Python package dependencies
-├── .env.example       # Environment template for API keys and configuration
-├── .gitignore         # Ignores sensitive keys and submission scratch files
-└── README.md          # Repository overview and setup guide
+Extract parameters from the following text as YAML.
+```
+
+**Failure mode:** The model treated *every* noun phrase as a parameter.
+It extracted CSR bit-field definitions (`csr[11:10]`, `csr[9:8]`) from
+Privileged Spec 2.1 as configurable parameters — they are not; they are
+fixed ISA encoding rules identical across all RISC-V implementations.
+
+### v2 — Keyword-guided prompt ([`prompts/v2_keyword.txt`](prompts/v2_keyword.txt))
+
+Added a list of trigger keywords (`implementation-specific`,
+`implementation-defined`, `may`, `might`, `should`, `optional`).
+
+**Improvement:** CSR constants were no longer extracted.
+**Remaining issue:** The `type` field was inconsistent — the model returned
+programming types like `integer` and `string` instead of ISA classification
+categories. The `constraints` field was a flat string instead of a list.
+
+### v3 — Production prompt ([`prompts/v3_final.txt`](prompts/v3_final.txt))
+
+Final prompt with three key additions:
+
+1. **Strict type enum** — `type` must be one of:
+   `implementation-specific | implementation-defined | optional | execution-environment-defined`
+2. **List constraints** — `constraints` must be a YAML list, not a flat string
+3. **1-shot example** — A concrete input→output example anchors the model's
+   formatting behaviour and prevents hallucination of the schema
+4. **Source traceability** — A `source` field links each parameter back to
+   the exact spec section it came from
+5. **Negative rules** — Explicit instructions to *not* extract fixed constants,
+   mandatory encoding rules, or static bit-field definitions
+
+---
+
+## Hallucination Mitigation
+
+| Technique | Why it works |
+|:---|:---|
+| **Grounding directive** | _"Every parameter you output MUST appear explicitly in the input text"_ — prevents the model from inventing parameters from its training data |
+| **Negative rules** | _"Do NOT extract fixed architectural constants"_ — explicitly blocks the most common failure mode (CSR bit encodings) |
+| **1-shot example** | Anchors output format so the model doesn't drift into wrong `type` values or flat-string constraints |
+| **Temperature = 0** | Eliminates sampling randomness; same input always produces same output |
+| **Post-hoc validation** | `validate.py` programmatically checks the output schema, catches leaked constants via a blocklist |
+
+---
+
+## Repository Structure
+
+```
+├── extractor.py          Main script — reads input, calls LLM, validates & saves YAML
+├── validate.py           Schema validator + negative-test checker for output.yaml
+├── input.txt             RISC-V specification snippets (provided in task)
+├── output.yaml           Extracted parameters (generated by extractor.py)
+├── requirements.txt      Python dependencies
+├── .env.example          Template for API key configuration
+├── prompts/
+│   ├── v1_naive.txt      Prompt iteration 1 — naive baseline
+│   ├── v2_keyword.txt    Prompt iteration 2 — keyword-guided
+│   └── v3_final.txt      Prompt iteration 3 — production (1-shot + negative rules)
+└── README.md
 ```
 
 ---
 
-## 🛠️ Quick Start & Execution
+## Quick Start
 
-1. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
 
-2. **Configure API Key (`.env`)**:
-   Copy `.env.example` to `.env` and insert your key:
-   ```env
-   GEMINI_API_KEY=your_gemini_api_key
-   # OR
-   OPENAI_API_KEY=your_openai_api_key
-   ```
+# 2. Configure API key
+cp .env.example .env
+# Edit .env → add your GEMINI_API_KEY or OPENAI_API_KEY
 
-3. **Run Parameter Extraction**:
-   ```bash
-   python extractor.py
-   ```
-   *(To run in offline demonstration mode without an API key, use `python extractor.py --mock`)*.
+# 3. Run extraction
+python extractor.py
+
+# 4. Validate output
+python validate.py
+```
 
 ---
 
-## 📄 Output Result (`output.yaml`)
+## Output (`output.yaml`)
 
 ```yaml
 parameters:
   - name: cache_capacity
-    description: The capacity of a cache in the system.
-    type: integer
-    constraints: Implementation-specific.
+    description: The capacity of a cache.
+    type: implementation-specific
+    constraints:
+      - Discoverable through the execution environment
+    source: "Privileged Spec 19.3.1"
+
   - name: cache_organization
-    description: The organization of a cache in the system.
-    type: string
-    constraints: Implementation-specific.
+    description: The organization of a cache.
+    type: implementation-specific
+    constraints:
+      - Discoverable through the execution environment
+    source: "Privileged Spec 19.3.1"
+
   - name: cache_block_size
     description: The size of a cache block.
-    type: integer
-    constraints: Implementation-specific. Must represent a contiguous, naturally aligned power-of-two (NAPOT) range of memory locations. In the initial set of CMO extensions, the size of a cache block shall be uniform throughout the system.
+    type: implementation-specific
+    constraints:
+      - Must represent a contiguous, naturally aligned power-of-two (or NAPOT) range of memory locations
+      - In the initial set of CMO extensions, the size of a cache block shall be uniform throughout the system
+      - Discoverable through the execution environment
+    source: "Privileged Spec 19.3.1"
+
+  - name: cache_discovery_mechanism
+    description: A means provided by the execution environment for software to discover information about caches and cache blocks.
+    type: execution-environment-defined
+    constraints:
+      - Must provide software a means to discover information about the caches and cache blocks in a system
+    source: "Privileged Spec 19.3.1"
 ```
+
+**Key observation:** Privileged Spec 2.1 (CSR address encoding) produced
+**zero parameters** — the prompt correctly identified all content in that
+section as fixed architectural constants, not configurable parameters.
+
+---
+
+## Validation
+
+```
+$ python validate.py
+Validated 4 parameter(s) in 'output.yaml'
+
+RESULT: PASS -- All checks passed.
+```
+
+The validator checks:
+- Valid YAML syntax
+- Root key is `parameters` containing a list
+- Each parameter has required fields (`name`, `description`, `type`, `constraints`)
+- `type` is from the allowed enum
+- `constraints` is a list (not a flat string)
+- No known architectural constants appear in the output (negative-test blocklist)

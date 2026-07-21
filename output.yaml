@@ -1,13 +1,27 @@
 parameters:
   - name: cache_capacity
-    description: The capacity of a cache in the system.
-    type: integer
-    constraints: Implementation-specific.
+    description: The capacity of a cache.
+    type: implementation-specific
+    constraints:
+      - Discoverable through the execution environment
+    source: "Privileged Spec 19.3.1"
   - name: cache_organization
-    description: The organization of a cache in the system.
-    type: string
-    constraints: Implementation-specific.
+    description: The organization of a cache.
+    type: implementation-specific
+    constraints:
+      - Discoverable through the execution environment
+    source: "Privileged Spec 19.3.1"
   - name: cache_block_size
     description: The size of a cache block.
-    type: integer
-    constraints: Implementation-specific. Must represent a contiguous, naturally aligned power-of-two (NAPOT) range of memory locations. In the initial set of CMO extensions, the size of a cache block shall be uniform throughout the system.
+    type: implementation-specific
+    constraints:
+      - Must represent a contiguous, naturally aligned power-of-two (or NAPOT) range of memory locations
+      - In the initial set of CMO extensions, the size of a cache block shall be uniform throughout the system
+      - Discoverable through the execution environment
+    source: "Privileged Spec 19.3.1"
+  - name: cache_discovery_mechanism
+    description: A means provided by the execution environment for software to discover information about caches and cache blocks.
+    type: execution-environment-defined
+    constraints:
+      - Must provide software a means to discover information about the caches and cache blocks in a system
+    source: "Privileged Spec 19.3.1"

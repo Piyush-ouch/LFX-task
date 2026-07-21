@@ -1,6 +1,8 @@
 # Environment & Sensitive Keys
 .env
-*.env
+
+# Submission Notes (kept locally, not pushed to GitHub)
+SUBMISSION.md
 
 # Python
 __pycache__/
@@ -8,8 +10,6 @@ __pycache__/
 *$py.class
 venv/
 .venv/
-env/
-.env/
 
 # IDE / Editor
 .vscode/
